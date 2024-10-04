@@ -3,6 +3,11 @@ import glob
 import numpy as np
 import openmc
 import os
+import scipy
+from scipy.special import erf
+from scipy.optimize import curve_fit
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
 
 def find_decay_probabilities(intensities):
     #intensities must be np array
@@ -11,7 +16,16 @@ def find_decay_probabilities(intensities):
     probabilities = intensities / total
     
     return probabilities.tolist()
+    
 
+def find_current_activity(initial_activity, time_passed_s, half_life):
+    #finds the current activity of the source based on the initial activity and the time passed
+
+    decay_const = np.log(2) / half_life
+    activity = initial_activity * np.exp(-1 * decay_const * time_passed_s)
+
+    return activity
+    
 
 def create_hpge_settings(num_particles, num_batches, source_location, decay_peaks, decay_probabilities):
     #creates settings for an isotropic point source
@@ -74,28 +88,46 @@ def openmc_sim(geometry, materials, settings, tallies):
     return tally_results
 
 
-def find_background_spectrum(spectrum):
-    #finds the background spectrum given a full hpge spectrum
-    background = []
+def scale_pulse_height_spectra(spectrum, current_activity, initial_activity):
+    #scales the pulse height spectra for the current activity of the source
+    #spectrum must be a numpy array
+
+    scaled_spectrum = spectrum *  (current_activity / initial_activity)
+
+    return scaled_spectrum
+
+
+def find_background_spectrum(energy_bins, spectrum):
+    #finds the background in a given spectra
+
+    #find the locations of the peaks
+    peaks, current = find_peaks(energy_bins, spectrum)
+
+    background_spectrum = []
+
+    def is_peak(index):
+        #helper function to check if an index correponds to a peak
+        return energy_bins[index] in peaks
 
     for i in range(len(spectrum)):
-        background_counter = 1
-        
-        while True:
-            left_index = i - background_counter
-            right_index = i + background_counter
-            
-            if left_index < 0 or right_index >= len(spectrum):
-                background.append(spectrum[i])
-                break
-            
-            if spectrum[right_index] < 1E-3 and spectrum[left_index] < 1E-3:
-                background.append((spectrum[left_index] + spectrum[right_index]) / 2)
-                break
-            
-            background_counter += 1
-    
-    return background
+        if energy_bins[i] in peaks:
+            background_bins = []
+
+            for offset in [-3, -2, -1, 1, 2, 3]:
+                adjacent_index = i + offset
+                if 0 <= adjacent_index < len(spectrum) and not is_peak(adjacent_index):
+                    background_bins.append(spectrum[adjacent_index])
+
+            if background_bins:
+                background = sum(background_bins) / len(background_bins)
+            else:
+                background = spectrum[i]
+        else:
+            background = spectrum[i]
+
+        background_spectrum.append(background)
+
+    return background_spectrum
 
 
 def get_background_removed_spectrum(spectrum, background):
@@ -105,7 +137,7 @@ def get_background_removed_spectrum(spectrum, background):
     for i in range(len(spectrum)):
         background_removed_data = spectrum[i] - background[i]
     
-        if background_removed_data < 0:
+        if background_removed_data < 1E-7:
             background_removed_spectrum.append(0)
 
         else:
@@ -130,16 +162,13 @@ def apply_gaussian_broadening(energy_bins, spectrum, fwhm):
 
 def find_peaks(energy_bins, spectrum):
     #finds peaks in a hpge simulation
-    peak_locations = list(scipy.signal.find_peaks(spectrum, distance = 10, prominence = 0.00005, width = 0.01))[0]
+    peak_locations = list(scipy.signal.find_peaks(spectrum, distance = 10, prominence = 0.00002, width = 0.01))[0]
     peaks = []
     current = []
     
     for location in peak_locations:
         peaks.append(float(energy_bins[location]))
         current.append(float(spectrum[location]))
-
-    peaks_list.append(peaks)
-    current_list.append(current)
     
     return peaks, current
 
@@ -155,3 +184,83 @@ def find_absolute_efficiency(energies, peaks, expected_energies, expected_peaks)
         efficiency_results.append(float(spectra_counts / (photon_counts))) #normalising denominator for photons emitted
 
     return efficiency_results
+    
+
+def create_intrinsic_efficiency_settings(crystal_radius, source_height, photon_beam_energies, num_batches, num_particles):
+    #creates a source of isotropically distributed energies incident on the face of the germanium crystal
+    spatial_dist = openmc.stats.CylindricalIndependent(
+        r = openmc.stats.Uniform(0, crystal_radius),
+        phi = openmc.stats.Uniform(0, 2 * np.pi),
+        z = openmc.stats.Discrete([source_height], [1])
+    )
+
+    direction_dist = openmc.stats.Monodirectional((0, 0, -1))
+
+    photon_beam_probabilities = np.full(len(photon_beam_energies), 1 / len(photon_beam_energies))
+    energy_dist = openmc.stats.Discrete(photon_beam_energies, photon_beam_probabilities)
+
+    source = openmc.IndependentSource()
+    source.space = spatial_dist
+    source.angle = direction_dist
+    source.energy = energy_dist
+    source.particle = 'photon'
+
+    settings = openmc.Settings()
+    settings.source = source
+    settings.batches = num_batches
+    settings.particles = num_particles
+    settings.run_mode = 'fixed source'
+
+    return settings
+
+
+def create_intrinsic_efficiency_tally(photon_beam_energies, germanium_crystal):
+    #creates a tally in order to find the number of photons passing through the crystal
+    energy_filter = openmc.EnergyFilter(photon_beam_energies)
+    surface_filter = openmc.SurfaceFilter(germanium_crystal)
+    #cell_filter = openmc.CellFilter(germanium_crystal)
+
+    efficiency_tally = openmc.Tally(name = 'photon_current')
+    efficiency_tally.filters = [surface_filter, energy_filter]
+    efficiency_tally.scores = ['current']
+
+    efficiency_tallies = openmc.Tallies([efficiency_tally])
+    efficiency_tallies.export_to_xml()
+
+    return efficiency_tallies
+
+
+def find_background_spectrum(energy_bins, spectrum):
+    #finds the background in a given spectra
+
+    #find the locations of the peaks
+    peaks, current = find_peaks(energy_bins, spectrum)
+
+    background_spectrum = []
+
+    def is_peak(index):
+        #helper function to check if an index correponds to a peak
+        return energy_bins[index] in peaks
+
+    for i in range(len(spectrum)):
+        if energy_bins[i] in peaks:
+            background_bins = []
+            background_energy = []
+
+            for offset in [-3, -2, -1, 1, 2, 3]:
+                adjacent_index = i + offset
+                if 0 <= adjacent_index < len(spectrum) and not is_peak(adjacent_index):
+                    background_bins.append(spectrum[adjacent_index])
+                    background_energy.append(energy_bins[adjacent_index])
+
+            if len(background_bins) >= 2:
+                interp_func = interp1d(background_energy, background_bins, kind = 'linear', fill_value = 'extrapolate')
+                background = interp_func(energy_bins[i])
+            else:
+                background = spectrum[i]
+        else:
+            background = spectrum[i]
+
+        background_spectrum.append(background)
+
+    return background_spectrum
